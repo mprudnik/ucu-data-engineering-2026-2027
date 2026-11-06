@@ -1,0 +1,46 @@
+# 1 master + 2 secondaries. All nodes listen on 8080 inside the Docker network.
+#
+# Host ports:
+#   master      -> localhost:28080
+#   secondary-1 -> localhost:28081
+#   secondary-2 -> localhost:28082
+#
+# Replicate delay per secondary (to see blocking replication):
+#   S1_DELAY_MS=5000 S2_DELAY_MS=6000 docker compose up --build
+#
+# `init: true` runs a small init as PID 1, so `docker compose stop` ends a node at once.
+
+services:
+  master:
+    build: .
+    image: replicated-log:latest
+    init: true
+    command: ["master"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      PORT: "8080"
+      SECONDARIES: http://secondary-1:8080,http://secondary-2:8080
+    ports: ["28080:8080"]
+    depends_on: [secondary-1, secondary-2]
+
+  secondary-1:
+    build: .
+    image: replicated-log:latest
+    init: true
+    command: ["secondary"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      PORT: "8080"
+      DELAY_MS: ${S1_DELAY_MS:-0}
+    ports: ["28081:8080"]
+
+  secondary-2:
+    build: .
+    image: replicated-log:latest
+    init: true
+    command: ["secondary"]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      PORT: "8080"
+      DELAY_MS: ${S2_DELAY_MS:-0}
+    ports: ["28082:8080"]
