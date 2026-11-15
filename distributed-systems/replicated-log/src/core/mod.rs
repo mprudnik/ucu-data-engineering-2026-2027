@@ -20,4 +20,7 @@ pub trait Client: Send + Sync + 'static {
 pub enum Error {
     #[display("Transport error: {code} ({message})")]
     Transport { code: i32, message: String },
+    /// Write concern is below 1 or above the number of nodes (master + secondaries).
+    #[display("Invalid write concern {requested}: must be between 1 and {max}")]
+    InvalidWriteConcern { requested: usize, max: usize },
 }

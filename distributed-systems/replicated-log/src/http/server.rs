@@ -12,23 +12,21 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use chrono::Utc;
 use serde::Deserialize;
 
-use crate::core::{
-    self, Request, master,
-    message::{Message, Replicate},
-    secondary,
-};
+use crate::core::{self, Request, master, message::Replicate, secondary};
 
-/// Body of the client `POST /append` request: `{"value": "..."}`.
+/// Body of the client `POST /append` request: `{"value": "...", "write_concern": 2}`.
 #[derive(Debug, Deserialize)]
 pub struct AppendBody {
     pub value: String,
+    /// How many nodes must have the message before the reply:
+    /// `1` = master only, `2` = master + 1 secondary, `3` = master + 2 secondaries.
+    pub write_concern: usize,
 }
 
 /// Master routes:
-/// - `POST /append` — append a message; returns after all secondaries ACK.
+/// - `POST /append` — append a message; returns after `write_concern` nodes have it.
 /// - `GET  /list`   — list all messages on the master.
 pub fn master_router<C: core::Client>(node: Arc<master::Node<C>>) -> Router {
     Router::new()
@@ -40,21 +38,18 @@ pub fn master_router<C: core::Client>(node: Arc<master::Node<C>>) -> Router {
 async fn master_append<C: core::Client>(
     State(node): State<Arc<master::Node<C>>>,
     Json(body): Json<AppendBody>,
-) -> Result<(StatusCode, Json<Message>), core::Error> {
-    // The master sets the timestamp; clients send only the text.
-    let message = Message {
-        value: body.value,
-        timestamp: Utc::now(),
-    };
-    tracing::info!(value = %message.value, "append request received");
-    node.append(message.clone()).await?;
-    tracing::info!(value = %message.value, "append done, all secondaries ACKed");
-    Ok((StatusCode::CREATED, Json(message)))
+) -> Result<StatusCode, core::Error> {
+    let write_concern = body.write_concern;
+    tracing::info!(value = %body.value, write_concern, "append request received");
+    // The master builds the message (with its sequence number); clients send only the text.
+    node.append(body.value, write_concern).await?;
+    tracing::info!(write_concern, "append done, write concern reached");
+    Ok(StatusCode::CREATED)
 }
 
 async fn master_list<C: core::Client>(
     State(node): State<Arc<master::Node<C>>>,
-) -> Json<Vec<Message>> {
+) -> Json<Vec<String>> {
     Json(node.list().await)
 }
 
@@ -73,24 +68,30 @@ async fn secondary_replicate(
     State(node): State<Arc<secondary::Node>>,
     Json(req): Json<Replicate>,
 ) -> Json<<Replicate as Request>::Response> {
-    tracing::info!(value = %req.message.value, "replicate request received");
+    let sequence_number = req.message.sequence_number;
+    tracing::info!(sequence_number, value = %req.message.value, "replicate request received");
     node.append(req.message).await;
-    tracing::info!("replicate done, sending ACK");
+    tracing::info!(sequence_number, "replicate done, sending ACK");
     // `Replicate::Response` is `()`, which is sent as JSON `null`.
     Json(())
 }
 
-async fn secondary_list(State(node): State<Arc<secondary::Node>>) -> Json<Vec<Message>> {
+async fn secondary_list(State(node): State<Arc<secondary::Node>>) -> Json<Vec<String>> {
     Json(node.list().await)
 }
 
-/// A core error in a handler means a secondary could not be reached
-/// or answered with an error, so the master replies `502 Bad Gateway`.
+/// Core errors as HTTP replies:
+/// - write concern out of range -> `400 Bad Request`;
+/// - a secondary could not be reached or failed -> `502 Bad Gateway`.
 impl IntoResponse for core::Error {
     fn into_response(self) -> Response {
-        tracing::error!(error = %self, "request failed");
+        let status = match self {
+            core::Error::InvalidWriteConcern { .. } => StatusCode::BAD_REQUEST,
+            core::Error::Transport { .. } => StatusCode::BAD_GATEWAY,
+        };
+        tracing::error!(error = %self, %status, "request failed");
         let body = Json(serde_json::json!({ "error": self.to_string() }));
-        (StatusCode::BAD_GATEWAY, body).into_response()
+        (status, body).into_response()
     }
 }
 

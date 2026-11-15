@@ -1,10 +1,12 @@
+use std::collections::BTreeMap;
+
 use tokio::sync::RwLock;
 
 use super::message::Message;
 
 #[derive(Default)]
 pub struct Node {
-    messages: RwLock<Vec<Message>>,
+    messages: RwLock<BTreeMap<usize, String>>,
 }
 
 impl Node {
@@ -13,10 +15,25 @@ impl Node {
     }
 
     pub async fn append(&self, message: Message) {
-        self.messages.write().await.push(message);
+        self.messages
+            .write()
+            .await
+            .insert(message.sequence_number, message.value);
     }
 
-    pub async fn list(&self) -> Vec<Message> {
-        self.messages.read().await.clone()
+    pub async fn list(&self) -> Vec<String> {
+        let all_messages = self.messages.read().await;
+
+        let mut ordered_messages = Vec::with_capacity(all_messages.len());
+
+        for (sequence_number, value) in all_messages.iter() {
+            let next_sequence_number = ordered_messages.len() + 1;
+            if *sequence_number != next_sequence_number {
+                break;
+            }
+            ordered_messages.push(value.clone());
+        }
+
+        ordered_messages
     }
 }
