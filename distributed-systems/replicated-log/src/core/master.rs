@@ -21,8 +21,19 @@ impl<C: super::Client> Node<C> {
         }
     }
 
-    pub async fn append(&self, message: Message) -> Result<(), super::Error> {
-        self.messages.write().await.push(message.clone());
+    pub async fn append(&self, value: String, write_concern: usize) -> Result<(), super::Error> {
+        self.validate_write_concern(write_concern)?;
+
+        let mut messages = self.messages.write().await;
+
+        let sequence_number = messages.len() + 1;
+
+        let message = Message {
+            value,
+            sequence_number,
+        };
+
+        messages.push(message.clone());
 
         let mut tasks = JoinSet::new();
         for secondary in self.secondaries.values() {
@@ -34,15 +45,37 @@ impl<C: super::Client> Node<C> {
             });
         }
 
-        let results = tasks.join_all().await;
-        for result in results {
-            result?;
+        std::mem::drop(messages);
+
+        for _ in 0..write_concern - 1 {
+            match tasks.join_next().await {
+                Some(result) => result.expect("replication failed")?,
+                None => break,
+            };
+        }
+        if !tasks.is_empty() {
+            tasks.detach_all();
         }
 
         Ok(())
     }
 
-    pub async fn list(&self) -> Vec<Message> {
-        self.messages.read().await.clone()
+    pub async fn list(&self) -> Vec<String> {
+        self.messages
+            .read()
+            .await
+            .iter()
+            .map(|m| m.value.clone())
+            .collect()
+    }
+
+    fn validate_write_concern(&self, requested: usize) -> Result<(), super::Error> {
+        let min = 1;
+        let max = self.secondaries.len() + 1;
+        if requested < min || requested > max {
+            return Err(super::Error::InvalidWriteConcern { requested, max });
+        }
+
+        Ok(())
     }
 }

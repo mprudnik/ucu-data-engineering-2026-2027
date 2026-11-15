@@ -1,10 +1,9 @@
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message {
     pub value: String,
-    pub timestamp: DateTime<Utc>,
+    pub sequence_number: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
