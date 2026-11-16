@@ -15,3 +15,11 @@ impl super::Request for Replicate {
     const METHOD: &'static str = "replicate";
     type Response = ();
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Heartbeat;
+
+impl super::Request for Heartbeat {
+    const METHOD: &'static str = "Heartbeat";
+    type Response = ();
+}
