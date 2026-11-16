@@ -15,10 +15,13 @@ impl Node {
     }
 
     pub async fn append(&self, message: Message) {
-        self.messages
-            .write()
-            .await
-            .insert(message.sequence_number, message.value);
+        let mut messages = self.messages.write().await;
+
+        if messages.contains_key(&message.sequence_number) {
+            return;
+        }
+
+        messages.insert(message.sequence_number, message.value);
     }
 
     pub async fn list(&self) -> Vec<String> {

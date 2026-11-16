@@ -8,7 +8,7 @@
 //! replicated-log secondary --port 8080
 //! ```
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
 use replicated_log::{
@@ -34,6 +34,15 @@ enum Role {
         /// Base URLs of the secondaries, comma separated.
         #[arg(long, env = "SECONDARIES", value_delimiter = ',', required = true)]
         secondaries: Vec<String>,
+        /// How long to wait for a secondary's ACK before sending again, in milliseconds.
+        #[arg(long, env = "REQUEST_TIMEOUT_MS", default_value_t = 5000)]
+        request_timeout_ms: u64,
+        /// Pause before sending a failed message again, in milliseconds.
+        #[arg(long, env = "RETRY_DELAY_MS", default_value_t = 1000)]
+        retry_delay_ms: u64,
+        /// Upper limit for the pause between attempts, which grows with each attempt, in milliseconds.
+        #[arg(long, env = "MAX_RETRY_DELAY_MS", default_value_t = 30_000)]
+        max_retry_delay_ms: u64,
     },
     /// Stores messages replicated by the master.
     Secondary {
@@ -51,8 +60,25 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match Cli::parse().role {
-        Role::Master { port, secondaries } => {
-            tracing::info!(?secondaries, "starting master");
+        Role::Master {
+            port,
+            secondaries,
+            request_timeout_ms,
+            retry_delay_ms,
+            max_retry_delay_ms,
+        } => {
+            tracing::info!(
+                ?secondaries,
+                request_timeout_ms,
+                retry_delay_ms,
+                max_retry_delay_ms,
+                "starting master"
+            );
+            let config = master::Config {
+                request_timeout: Duration::from_millis(request_timeout_ms),
+                retry_delay: Duration::from_millis(retry_delay_ms),
+                max_retry_delay: Duration::from_millis(max_retry_delay_ms),
+            };
             // Secondaries get ids 1, 2, ... in the order of the --secondaries list.
             let clients = secondaries
                 .into_iter()
@@ -63,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
                     (NodeId(i + 1), client)
                 })
                 .collect();
-            let node = Arc::new(master::Node::new(clients));
+            let node = Arc::new(master::Node::new(config, clients));
             server::serve(server::master_router(node), port).await?;
         }
         Role::Secondary { port } => {

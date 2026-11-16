@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use tokio::{sync::RwLock, task::JoinSet};
 
@@ -7,16 +7,23 @@ use super::{
     message::{Message, Replicate},
 };
 
+pub struct Config {
+    pub request_timeout: Duration,
+    pub retry_delay: Duration,
+    pub max_retry_delay: Duration,
+}
+
 pub struct Node<C: super::Client> {
+    config: Arc<Config>,
     messages: RwLock<Vec<Message>>,
     secondaries: HashMap<NodeId, Arc<C>>,
 }
 
 impl<C: super::Client> Node<C> {
-    pub fn new(secondaries: HashMap<NodeId, Arc<C>>) -> Self {
-        let messages = RwLock::new(Vec::new());
+    pub fn new(config: Config, secondaries: HashMap<NodeId, Arc<C>>) -> Self {
         Self {
-            messages,
+            config: Arc::new(config),
+            messages: RwLock::new(Vec::new()),
             secondaries,
         }
     }
@@ -37,12 +44,11 @@ impl<C: super::Client> Node<C> {
 
         let mut tasks = JoinSet::new();
         for secondary in self.secondaries.values() {
-            let secondary = secondary.clone();
-            let message = message.clone();
-            tasks.spawn(async move {
-                let request = Replicate { message };
-                secondary.send(request).await
-            });
+            tasks.spawn(Self::replicate(
+                self.config.clone(),
+                secondary.clone(),
+                message.clone(),
+            ));
         }
 
         std::mem::drop(messages);
@@ -76,6 +82,28 @@ impl<C: super::Client> Node<C> {
             return Err(super::Error::InvalidWriteConcern { requested, max });
         }
 
+        Ok(())
+    }
+
+    async fn replicate(
+        config: Arc<Config>,
+        node: Arc<C>,
+        message: Message,
+    ) -> Result<(), super::Error> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let request = Replicate {
+                message: message.clone(),
+            };
+            match tokio::time::timeout(config.request_timeout, node.send(request)).await {
+                Ok(Ok(())) => break,
+                Ok(Err(err)) => tracing::warn!(%err, "send failed, retrying"),
+                Err(_) => tracing::warn!("timeout, retrying"),
+            };
+            let retry_delay = (config.retry_delay * attempt).min(config.max_retry_delay);
+            tokio::time::sleep(retry_delay).await;
+        }
         Ok(())
     }
 }

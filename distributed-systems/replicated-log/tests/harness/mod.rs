@@ -5,7 +5,13 @@
 //! through [`Network`]:
 //! - request delay: master -> secondary, before the secondary handles the request;
 //! - response delay: secondary -> master, before the master gets the ACK;
-//! - reordering: hold the next N requests to a secondary, then deliver them in reverse order.
+//! - reordering: hold the next N requests to a secondary, then deliver them in reverse order;
+//! - request drop: the request is lost, the secondary never sees it, no reply comes;
+//! - response drop: the secondary handles the request, but the ACK is lost;
+//! - stopped secondary: every request fails at once with a transport error.
+//!
+//! A dropped request or response never gets a reply. The master stops waiting
+//! only by its own request timeout ([`master::Config::request_timeout`]).
 //!
 //! Use `#[tokio::test(start_paused = true)]`. Delays then finish at once,
 //! and `tokio::time::Instant::elapsed()` returns the exact delay.
@@ -30,15 +36,39 @@ pub const SECONDARIES: usize = 2;
 pub const S1: NodeId = NodeId(1);
 pub const S2: NodeId = NodeId(2);
 
+/// Master settings used by [`Cluster::new`].
+/// The timeout is longer than any delay in the tests, so a slow secondary
+/// is never retried. Tests for retries use [`Cluster::with_config`].
+const LONG_TIMEOUT_CONFIG: master::Config = master::Config {
+    request_timeout: Duration::from_secs(60 * 60),
+    retry_delay: Duration::from_secs(1),
+    max_retry_delay: Duration::from_secs(30),
+};
+
 /// Link settings shared by all harness clients.
-/// Settings are read when a send task first runs, so the test can change them between appends.
-/// With write concern below all nodes, `append` returns before its background sends have run:
+///
+/// Settings are read once, when a send starts. A change does not affect
+/// requests that are already on the way.
+/// With write concern below all nodes, `append` returns before its background sends have started:
 /// call [`settle`] before changing settings, or the change also applies to those sends.
 #[derive(Default)]
 pub struct Network {
-    request_delays: Mutex<HashMap<NodeId, Duration>>,
-    response_delays: Mutex<HashMap<NodeId, Duration>>,
+    links: Mutex<HashMap<NodeId, Link>>,
     reorders: Mutex<HashMap<NodeId, Reorder>>,
+    /// Number of sends the master started, per secondary (each retry counts).
+    sent_requests: Mutex<HashMap<NodeId, usize>>,
+    /// Number of requests the secondary handled, per secondary.
+    delivered_requests: Mutex<HashMap<NodeId, usize>>,
+}
+
+/// Settings of the link from the master to one secondary.
+#[derive(Debug, Default, Clone, Copy)]
+struct Link {
+    request_delay: Duration,
+    response_delay: Duration,
+    drop_requests: bool,
+    drop_responses: bool,
+    stopped: bool,
 }
 
 /// Requests held for one secondary until `count` of them have arrived.
@@ -70,20 +100,50 @@ enum ReorderStep {
 impl Network {
     /// Delay every request from the master to secondary `to`.
     pub fn set_delay(&self, to: NodeId, delay: Duration) {
-        self.request_delays.lock().unwrap().insert(to, delay);
+        self.update_link(to, |link| link.request_delay = delay);
     }
 
     pub fn remove_delay(&self, to: NodeId) {
-        self.request_delays.lock().unwrap().remove(&to);
+        self.update_link(to, |link| link.request_delay = Duration::ZERO);
     }
 
     /// Delay every response (ACK) from secondary `to` back to the master.
     pub fn set_response_delay(&self, to: NodeId, delay: Duration) {
-        self.response_delays.lock().unwrap().insert(to, delay);
+        self.update_link(to, |link| link.response_delay = delay);
     }
 
     pub fn remove_response_delay(&self, to: NodeId) {
-        self.response_delays.lock().unwrap().remove(&to);
+        self.update_link(to, |link| link.response_delay = Duration::ZERO);
+    }
+
+    /// Lose every request to secondary `to`: the secondary never sees it,
+    /// and the master gets no reply.
+    pub fn drop_requests(&self, to: NodeId) {
+        self.update_link(to, |link| link.drop_requests = true);
+    }
+
+    pub fn remove_drop(&self, to: NodeId) {
+        self.update_link(to, |link| link.drop_requests = false);
+    }
+
+    /// Lose every response (ACK) from secondary `to`: the secondary handles
+    /// the request and stores the message, but the master gets no reply.
+    pub fn drop_responses(&self, to: NodeId) {
+        self.update_link(to, |link| link.drop_responses = true);
+    }
+
+    pub fn remove_response_drop(&self, to: NodeId) {
+        self.update_link(to, |link| link.drop_responses = false);
+    }
+
+    /// Secondary `to` is down: every request fails at once with a transport
+    /// error, as when the connection is refused.
+    pub fn stop_secondary(&self, to: NodeId) {
+        self.update_link(to, |link| link.stopped = true);
+    }
+
+    pub fn start_secondary(&self, to: NodeId) {
+        self.update_link(to, |link| link.stopped = false);
     }
 
     /// Hold the next `count` requests to secondary `to`, then deliver them
@@ -100,8 +160,23 @@ impl Network {
         self.reorders.lock().unwrap().insert(to, reorder);
     }
 
-    fn request_delay(&self, to: NodeId) -> Duration {
-        self.request_delays
+    /// How many sends to secondary `to` the master started, retries included.
+    pub fn sent_requests(&self, to: NodeId) -> usize {
+        Self::count(&self.sent_requests, to)
+    }
+
+    /// How many requests secondary `to` handled. With retries this can be
+    /// more than the number of messages: the secondary got duplicates.
+    pub fn delivered_requests(&self, to: NodeId) -> usize {
+        Self::count(&self.delivered_requests, to)
+    }
+
+    fn update_link(&self, to: NodeId, change: impl FnOnce(&mut Link)) {
+        change(self.links.lock().unwrap().entry(to).or_default());
+    }
+
+    fn link(&self, to: NodeId) -> Link {
+        self.links
             .lock()
             .unwrap()
             .get(&to)
@@ -109,13 +184,12 @@ impl Network {
             .unwrap_or_default()
     }
 
-    fn response_delay(&self, to: NodeId) -> Duration {
-        self.response_delays
-            .lock()
-            .unwrap()
-            .get(&to)
-            .copied()
-            .unwrap_or_default()
+    fn count(counters: &Mutex<HashMap<NodeId, usize>>, to: NodeId) -> usize {
+        counters.lock().unwrap().get(&to).copied().unwrap_or(0)
+    }
+
+    fn increment(counters: &Mutex<HashMap<NodeId, usize>>, to: NodeId) {
+        *counters.lock().unwrap().entry(to).or_insert(0) += 1;
     }
 
     fn reorder_step(&self, to: NodeId, method: &'static str, body: Value) -> ReorderStep {
@@ -135,6 +209,18 @@ impl Network {
         let batch = reorders.remove(&to).expect("reorder exists").held;
         ReorderStep::DeliverBatch(batch, receiver)
     }
+
+    /// Hands one request to the secondary and counts it.
+    async fn dispatch(
+        &self,
+        to: NodeId,
+        target: &secondary::Node,
+        method: &str,
+        body: Value,
+    ) -> Result<Value, core::Error> {
+        Self::increment(&self.delivered_requests, to);
+        dispatch(target, method, body).await
+    }
 }
 
 /// The master's connection to one secondary, in memory.
@@ -149,27 +235,63 @@ impl core::Client for Client {
         // Go through JSON like the HTTP client does. This also checks the serde derives.
         let body = serde_json::to_value(req).map_err(serde_error)?;
 
-        tokio::time::sleep(self.network.request_delay(self.to)).await;
-        let reply = self.deliver(R::METHOD, body).await?;
-        tokio::time::sleep(self.network.response_delay(self.to)).await;
+        let link = self.network.link(self.to);
+        Network::increment(&self.network.sent_requests, self.to);
+
+        if link.stopped {
+            return Err(core::Error::Transport {
+                code: 0,
+                message: format!("secondary {} is stopped", self.to.0),
+            });
+        }
+        if link.drop_requests {
+            // Lost on the way: no reply ever comes.
+            return std::future::pending().await;
+        }
+
+        // The delivery runs in its own task, so it still reaches the secondary
+        // when the master stops waiting (timeout) and drops this future.
+        // A slow request then arrives late, next to its retry.
+        let delivery = tokio::spawn(deliver(
+            Arc::clone(&self.network),
+            self.to,
+            Arc::clone(&self.target),
+            R::METHOD,
+            body,
+            link.request_delay,
+        ));
+        let reply = delivery.await.expect("delivery task panicked")?;
+
+        if link.drop_responses {
+            // The secondary handled the request, but the ACK is lost.
+            return std::future::pending().await;
+        }
+        tokio::time::sleep(link.response_delay).await;
 
         serde_json::from_value(reply).map_err(serde_error)
     }
 }
 
-impl Client {
-    /// Hands the request to the secondary, unless a reorder batch holds it.
-    async fn deliver(&self, method: &'static str, body: Value) -> Result<Value, core::Error> {
-        match self.network.reorder_step(self.to, method, body) {
-            ReorderStep::Deliver(body) => dispatch(&self.target, method, body).await,
-            ReorderStep::Wait(receiver) => receiver.await.expect("reorder batch was dropped"),
-            ReorderStep::DeliverBatch(batch, receiver) => {
-                for held in batch.into_iter().rev() {
-                    let reply = dispatch(&self.target, held.method, held.body).await;
-                    let _ = held.reply.send(reply);
-                }
-                receiver.await.expect("reply to own request was dropped")
+/// Waits for the request delay, then hands the request to the secondary,
+/// unless a reorder batch holds it.
+async fn deliver(
+    network: Arc<Network>,
+    to: NodeId,
+    target: Arc<secondary::Node>,
+    method: &'static str,
+    body: Value,
+    request_delay: Duration,
+) -> Result<Value, core::Error> {
+    tokio::time::sleep(request_delay).await;
+    match network.reorder_step(to, method, body) {
+        ReorderStep::Deliver(body) => network.dispatch(to, &target, method, body).await,
+        ReorderStep::Wait(receiver) => receiver.await.expect("reorder batch was dropped"),
+        ReorderStep::DeliverBatch(batch, receiver) => {
+            for held in batch.into_iter().rev() {
+                let reply = network.dispatch(to, &target, held.method, held.body).await;
+                let _ = held.reply.send(reply);
             }
+            receiver.await.expect("reply to own request was dropped")
         }
     }
 }
@@ -216,7 +338,14 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    /// Cluster where the master never times out on a slow secondary.
+    /// For tests without failures (iterations 1 and 2).
     pub fn new(secondaries: usize) -> Self {
+        Self::with_config(LONG_TIMEOUT_CONFIG, secondaries)
+    }
+
+    /// Cluster with the given master settings (timeout, retry delay).
+    pub fn with_config(config: master::Config, secondaries: usize) -> Self {
         init_logging();
         let network = Arc::new(Network::default());
         let secondaries: HashMap<_, _> = (1..=secondaries)
@@ -234,7 +363,7 @@ impl Cluster {
             })
             .collect();
         Self {
-            master: master::Node::new(clients),
+            master: master::Node::new(config, clients),
             secondaries,
             network,
         }
@@ -272,7 +401,7 @@ impl Cluster {
 }
 
 /// Lets background replication run until it is blocked again
-/// (by a delay, a reorder batch, or because it is done).
+/// (by a delay, a reorder batch, a dropped message, or because it is done).
 ///
 /// With paused time, Tokio moves the clock only when no task can run.
 /// So all ready tasks run first. Moves the clock by 1ms.

@@ -20,6 +20,12 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       PORT: "8080"
       SECONDARIES: http://secondary-1:8080,http://secondary-2:8080
+      # How long to wait for a secondary's ACK before sending again.
+      REQUEST_TIMEOUT_MS: ${REQUEST_TIMEOUT_MS:-5000}
+      # Pause before sending a failed message again.
+      RETRY_DELAY_MS: ${RETRY_DELAY_MS:-1000}
+      # Upper limit for the pause, which grows with each attempt.
+      MAX_RETRY_DELAY_MS: ${MAX_RETRY_DELAY_MS:-30000}
     ports: ["28080:8080"]
     depends_on: [secondary-1, secondary-2]
 
