@@ -115,6 +115,7 @@ impl IntoResponse for core::Error {
         let status = match self {
             core::Error::InvalidWriteConcern { .. } => StatusCode::BAD_REQUEST,
             core::Error::Transport { .. } => StatusCode::BAD_GATEWAY,
+            core::Error::NoQuorum { .. } => StatusCode::SERVICE_UNAVAILABLE,
         };
         tracing::error!(error = %self, %status, "request failed");
         let body = Json(serde_json::json!({ "error": self.to_string() }));

@@ -67,6 +67,8 @@ impl<C: super::Client> Node<C> {
 
     pub async fn append(&self, value: String, write_concern: usize) -> Result<(), super::Error> {
         self.validate_write_concern(write_concern)?;
+        // Before the sequence number is taken: a rejected message never enters the log.
+        self.check_quorum().await?;
 
         let mut messages = self.messages.write().await;
 
@@ -159,6 +161,31 @@ impl<C: super::Client> Node<C> {
             health.insert(id.clone(), secondary.read().await.health);
         }
         health
+    }
+
+    /// Quorum append: a majority of nodes (master + secondaries) must be available,
+    /// otherwise the master is read-only and rejects appends.
+    /// The master always counts. A secondary counts unless it is Unhealthy:
+    /// Suspected only missed a few heartbeats.
+    async fn check_quorum(&self) -> Result<(), super::Error> {
+        let total = self.secondaries.len() + 1;
+        let required = total / 2 + 1;
+
+        let mut available = 1; // the master
+        for secondary in self.secondaries.values() {
+            if secondary.read().await.health != NodeHealth::Unhealthy {
+                available += 1;
+            }
+        }
+
+        if available < required {
+            return Err(super::Error::NoQuorum {
+                available,
+                required,
+                total,
+            });
+        }
+        Ok(())
     }
 
     fn validate_write_concern(&self, requested: usize) -> Result<(), super::Error> {

@@ -19,6 +19,19 @@ Each iteration lives in its own branch (`ds-rl-iter-1`, `ds-rl-iter-2`, `ds-rl-i
   with the same sequence number. It still sends the ACK, so the master stops retrying.
 - **Total order**: the same as in iteration 2. A secondary with `[m1, m2, m4]` shows only `[m1, m2]`
   until the retry brings `m3`.
+- **Heartbeats**: the master sends a heartbeat to each secondary every `heartbeat_interval`,
+  one task per secondary. The status depends on the time since the last successful heartbeat:
+  - `healthy` — less than `suspected_after`; one successful heartbeat is enough to get back here;
+  - `suspected` — more than `suspected_after`;
+  - `unhealthy` — more than `unhealthy_after`.
+
+  The status changes retries: Healthy — the pause described above; Suspected — twice that pause;
+  Unhealthy — no sends at all, the master checks the status again every `max_retry_delay`.
+  `GET /health` on the master shows the statuses.
+- **Quorum append**: the master accepts appends only while a majority of nodes is available
+  (`nodes / 2 + 1`, master included). A secondary counts unless it is Unhealthy.
+  With 3 nodes, the master and one secondary are enough. Without a quorum the master is
+  read-only: every append, with any write concern, gets `503`.
 
 ## Iteration 2
 
@@ -80,6 +93,19 @@ Retry settings of the master, as environment variables (also read by `docker com
 | `REQUEST_TIMEOUT_MS` | 5000    | how long to wait for an ACK before sending again |
 | `RETRY_DELAY_MS`     | 1000    | pause after the first failed attempt; grows with each attempt |
 | `MAX_RETRY_DELAY_MS` | 30000   | upper limit for the pause                        |
+| `HEARTBEAT_INTERVAL_MS` | 1000 | how often to send a heartbeat to each secondary  |
+| `SUSPECTED_AFTER_MS` | 3000    | no successful heartbeat for this long -> suspected |
+| `UNHEALTHY_AFTER_MS` | 10000   | no successful heartbeat for this long -> unhealthy |
+
+To see heartbeats and quorum, stop both secondaries and watch the statuses:
+
+```sh
+docker compose stop secondary-1 secondary-2
+curl localhost:28080/health   # {"1":"suspected","2":"suspected"} after ~3s, "unhealthy" after ~10s
+curl -X POST localhost:28080/append -H 'content-type: application/json' -d '{"value": "m1", "write_concern": 1}'  # 503 once both are unhealthy
+docker compose start secondary-1
+curl localhost:28080/health   # {"1":"healthy","2":"unhealthy"}; appends work again
+```
 
 ```sh
 REQUEST_TIMEOUT_MS=2000 docker compose up
@@ -98,10 +124,14 @@ curl -X POST localhost:28080/append \
 
 # List
 curl localhost:28080/list
+
+# Status of each secondary, by id (position in SECONDARIES, from 1)
+curl localhost:28080/health   # {"1":"healthy","2":"suspected"}
 ```
 
 Errors, as `{"error": "..."}`:
-- `400` — `write_concern` is below 1 or above the number of nodes.
+- `400` — `write_concern` is below 1 or above the number of nodes;
+- `503` — no quorum, the master is read-only.
 
 A secondary that cannot be reached is not an error: the master retries it, and the append waits.
 
@@ -111,7 +141,7 @@ A secondary that cannot be reached is not an error: the master retries it, and t
 curl localhost:28081/list
 ```
 
-`POST /replicate` is internal. Only the master calls it.
+`POST /replicate` and `POST /heartbeat` are internal. Only the master calls them.
 
 ## Run without Docker
 
@@ -122,7 +152,8 @@ cargo run -- master --port 8080 --secondaries http://localhost:8081,http://local
 ```
 
 Every option can also be set with an environment variable:
-`PORT`, `SECONDARIES`, `REQUEST_TIMEOUT_MS`, `RETRY_DELAY_MS`, `MAX_RETRY_DELAY_MS`.
+`PORT`, `SECONDARIES`, `REQUEST_TIMEOUT_MS`, `RETRY_DELAY_MS`, `MAX_RETRY_DELAY_MS`,
+`HEARTBEAT_INTERVAL_MS`, `SUSPECTED_AFTER_MS`, `UNHEALTHY_AFTER_MS`.
 See `cargo run -- master --help`.
 
 ## Tests
@@ -151,6 +182,8 @@ Tokio paused time is used, so delays and timeouts do not slow down the tests.
 | `tests/write_concern.rs` | write concern 1/2/3, bad values, eventual consistency, acceptance test |
 | `tests/ordering.rs`      | total order: reordered messages, gaps, concurrent appends   |
 | `tests/retry.rs`         | retry after lost messages and ACKs, deduplication, total order with retries, acceptance test |
+| `tests/heartbeat.rs`     | status changes, retry pause by status, no sends to an unhealthy secondary |
+| `tests/quorum.rs`        | read-only without quorum, suspected counts, quorum comes back |
 
 ## Code layout
 
@@ -170,7 +203,9 @@ tests/
 ├── replication.rs
 ├── write_concern.rs
 ├── ordering.rs
-└── retry.rs
+├── retry.rs
+├── heartbeat.rs
+└── quorum.rs
 ```
 
 The master knows only the `core::Client` trait. In production it is the HTTP client.
