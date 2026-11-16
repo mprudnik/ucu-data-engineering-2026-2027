@@ -7,18 +7,20 @@
 use std::time::Duration;
 
 use harness::{Cluster, S1, S2, SECONDARIES, settle};
-use replicated_log::core::master;
+use replicated_log::core::{Request, master, message::Replicate};
 
 mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
 /// Short timeout: a lost or slow message is sent again within a few seconds.
-const RETRY_CONFIG: master::Config = master::Config {
-    request_timeout: Duration::from_secs(2),
-    retry_delay: Duration::from_secs(1),
-    max_retry_delay: Duration::from_secs(30),
-};
+/// The other settings are the defaults (retry delay 1s, max retry delay 30s).
+fn retry_config() -> master::Config {
+    master::Config {
+        request_timeout: Duration::from_secs(2),
+        ..Default::default()
+    }
+}
 
 /// Time for the master to notice a failure and send again:
 /// longer than the timeout plus the max retry delay.
@@ -29,7 +31,7 @@ const RETRY_WAIT: Duration = Duration::from_secs(60);
 /// and S1 gets it after the link is back.
 #[tokio::test(start_paused = true)]
 async fn lost_message_is_retried() -> anyhow::Result<()> {
-    let cluster = Cluster::with_config(RETRY_CONFIG, SECONDARIES);
+    let cluster = Cluster::with_config(retry_config(), SECONDARIES);
     cluster.network.drop_requests(S1);
 
     // Write concern 1: the append does not wait for S1.
@@ -37,7 +39,7 @@ async fn lost_message_is_retried() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     assert_eq!(cluster.secondary_values(S1).await, NO_MESSAGES);
-    let sent = cluster.network.sent_requests(S1);
+    let sent = cluster.network.sent_requests(S1, Replicate::METHOD);
     assert!(sent >= 2, "m1 should be sent several times, was sent {sent} times");
 
     cluster.network.remove_drop(S1);
@@ -53,7 +55,7 @@ async fn lost_message_is_retried() -> anyhow::Result<()> {
 /// again, and the late copies still reach S2. S2 must store m2 only once.
 #[tokio::test(start_paused = true)]
 async fn slow_message_is_retried_and_stored_once() -> anyhow::Result<()> {
-    let cluster = Cluster::with_config(RETRY_CONFIG, SECONDARIES);
+    let cluster = Cluster::with_config(retry_config(), SECONDARIES);
 
     cluster.append("m1", 1).await?;
     settle().await;
@@ -67,7 +69,7 @@ async fn slow_message_is_retried_and_stored_once() -> anyhow::Result<()> {
 
     assert_eq!(cluster.secondary_values(S2).await, ["m1", "m2"]);
     // m1 once, m2 at least twice: S2 got duplicates of m2.
-    let delivered = cluster.network.delivered_requests(S2);
+    let delivered = cluster.network.delivered_requests(S2, Replicate::METHOD);
     assert!(delivered >= 3, "S2 should get m2 more than once, got {delivered} requests");
 
     Ok(())
@@ -77,7 +79,7 @@ async fn slow_message_is_retried_and_stored_once() -> anyhow::Result<()> {
 /// With write concern 3, the append waits for that ACK. S1 must store m1 only once.
 #[tokio::test(start_paused = true)]
 async fn lost_ack_is_retried_and_message_stored_once() -> anyhow::Result<()> {
-    let cluster = Cluster::with_config(RETRY_CONFIG, SECONDARIES);
+    let cluster = Cluster::with_config(retry_config(), SECONDARIES);
     cluster.network.drop_responses(S1);
     let lost_ack_time = Duration::from_secs(10);
 
@@ -90,7 +92,7 @@ async fn lost_ack_is_retried_and_message_stored_once() -> anyhow::Result<()> {
     assert!(m1_elapsed? >= lost_ack_time);
 
     assert_eq!(cluster.secondary_values(S1).await, ["m1"]);
-    let delivered = cluster.network.delivered_requests(S1);
+    let delivered = cluster.network.delivered_requests(S1, Replicate::METHOD);
     assert!(delivered >= 2, "S1 should get m1 more than once, got {delivered} requests");
 
     Ok(())
@@ -102,9 +104,8 @@ async fn lost_ack_is_retried_and_message_stored_once() -> anyhow::Result<()> {
 async fn secondary_hides_messages_until_retry_fills_the_gap() -> anyhow::Result<()> {
     // Retry delay big enough to check S1 before m3 is sent again.
     let config = master::Config {
-        request_timeout: Duration::from_secs(2),
         retry_delay: Duration::from_secs(10),
-        max_retry_delay: Duration::from_secs(30),
+        ..retry_config()
     };
     let cluster = Cluster::with_config(config, SECONDARIES);
 
@@ -141,7 +142,7 @@ async fn secondary_hides_messages_until_retry_fills_the_gap() -> anyhow::Result<
 /// 7. S2 has [m1, m2, m3, m4]
 #[tokio::test(start_paused = true)]
 async fn iteration_3_acceptance_test() -> anyhow::Result<()> {
-    let cluster = Cluster::with_config(RETRY_CONFIG, SECONDARIES);
+    let cluster = Cluster::with_config(retry_config(), SECONDARIES);
     let s2_down_time = Duration::from_secs(30);
     cluster.network.stop_secondary(S2);
 

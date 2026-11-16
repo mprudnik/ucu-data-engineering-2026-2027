@@ -29,7 +29,12 @@ use tokio::{sync::oneshot, time::Instant};
 
 /// Re-exported so tests can write `harness::NodeId`.
 pub use replicated_log::core::NodeId;
-use replicated_log::core::{self, Request, master, message::Replicate, secondary};
+pub use replicated_log::core::NodeHealth;
+use replicated_log::core::{
+    self, Request, master,
+    message::{Heartbeat, Replicate},
+    secondary,
+};
 
 /// Default cluster size in tests: master + 2 secondaries.
 pub const SECONDARIES: usize = 2;
@@ -39,11 +44,12 @@ pub const S2: NodeId = NodeId(2);
 /// Master settings used by [`Cluster::new`].
 /// The timeout is longer than any delay in the tests, so a slow secondary
 /// is never retried. Tests for retries use [`Cluster::with_config`].
-const LONG_TIMEOUT_CONFIG: master::Config = master::Config {
-    request_timeout: Duration::from_secs(60 * 60),
-    retry_delay: Duration::from_secs(1),
-    max_retry_delay: Duration::from_secs(30),
-};
+fn long_timeout_config() -> master::Config {
+    master::Config {
+        request_timeout: Duration::from_secs(60 * 60),
+        ..Default::default()
+    }
+}
 
 /// Link settings shared by all harness clients.
 ///
@@ -55,10 +61,18 @@ const LONG_TIMEOUT_CONFIG: master::Config = master::Config {
 pub struct Network {
     links: Mutex<HashMap<NodeId, Link>>,
     reorders: Mutex<HashMap<NodeId, Reorder>>,
-    /// Number of sends the master started, per secondary (each retry counts).
-    sent_requests: Mutex<HashMap<NodeId, usize>>,
-    /// Number of requests the secondary handled, per secondary.
-    delivered_requests: Mutex<HashMap<NodeId, usize>>,
+    /// Every send the master started (each retry counts), in order.
+    sent: Mutex<Vec<RecordedRequest>>,
+    /// Every request a secondary handled, in order.
+    delivered: Mutex<Vec<RecordedRequest>>,
+}
+
+/// One request seen by the harness: to which secondary, which method, and when.
+#[derive(Debug, Clone, Copy)]
+struct RecordedRequest {
+    to: NodeId,
+    method: &'static str,
+    at: Instant,
 }
 
 /// Settings of the link from the master to one secondary.
@@ -160,15 +174,21 @@ impl Network {
         self.reorders.lock().unwrap().insert(to, reorder);
     }
 
-    /// How many sends to secondary `to` the master started, retries included.
-    pub fn sent_requests(&self, to: NodeId) -> usize {
-        Self::count(&self.sent_requests, to)
+    /// How many `method` sends to secondary `to` the master started, retries included.
+    /// `method` is a request's `METHOD`, e.g. `Replicate::METHOD`.
+    pub fn sent_requests(&self, to: NodeId, method: &str) -> usize {
+        self.sent_times(to, method).len()
     }
 
-    /// How many requests secondary `to` handled. With retries this can be
+    /// When the master started each `method` send to secondary `to`, oldest first.
+    pub fn sent_times(&self, to: NodeId, method: &str) -> Vec<Instant> {
+        Self::times(&self.sent, to, method)
+    }
+
+    /// How many `method` requests secondary `to` handled. With retries this can be
     /// more than the number of messages: the secondary got duplicates.
-    pub fn delivered_requests(&self, to: NodeId) -> usize {
-        Self::count(&self.delivered_requests, to)
+    pub fn delivered_requests(&self, to: NodeId, method: &str) -> usize {
+        Self::times(&self.delivered, to, method).len()
     }
 
     fn update_link(&self, to: NodeId, change: impl FnOnce(&mut Link)) {
@@ -184,12 +204,18 @@ impl Network {
             .unwrap_or_default()
     }
 
-    fn count(counters: &Mutex<HashMap<NodeId, usize>>, to: NodeId) -> usize {
-        counters.lock().unwrap().get(&to).copied().unwrap_or(0)
+    fn times(log: &Mutex<Vec<RecordedRequest>>, to: NodeId, method: &str) -> Vec<Instant> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.to == to && request.method == method)
+            .map(|request| request.at)
+            .collect()
     }
 
-    fn increment(counters: &Mutex<HashMap<NodeId, usize>>, to: NodeId) {
-        *counters.lock().unwrap().entry(to).or_insert(0) += 1;
+    fn record(log: &Mutex<Vec<RecordedRequest>>, to: NodeId, method: &'static str) {
+        let at = Instant::now();
+        log.lock().unwrap().push(RecordedRequest { to, method, at });
     }
 
     fn reorder_step(&self, to: NodeId, method: &'static str, body: Value) -> ReorderStep {
@@ -215,10 +241,10 @@ impl Network {
         &self,
         to: NodeId,
         target: &secondary::Node,
-        method: &str,
+        method: &'static str,
         body: Value,
     ) -> Result<Value, core::Error> {
-        Self::increment(&self.delivered_requests, to);
+        Self::record(&self.delivered, to, method);
         dispatch(target, method, body).await
     }
 }
@@ -236,7 +262,7 @@ impl core::Client for Client {
         let body = serde_json::to_value(req).map_err(serde_error)?;
 
         let link = self.network.link(self.to);
-        Network::increment(&self.network.sent_requests, self.to);
+        Network::record(&self.network.sent, self.to, R::METHOD);
 
         if link.stopped {
             return Err(core::Error::Transport {
@@ -304,6 +330,10 @@ async fn dispatch(node: &secondary::Node, method: &str, body: Value) -> Result<V
             node.append(req.message).await;
             Ok(Value::Null) // `Replicate::Response` is `()`
         }
+        m if m == Heartbeat::METHOD => {
+            let _: Heartbeat = serde_json::from_value(body).map_err(serde_error)?;
+            Ok(Value::Null) // `Heartbeat::Response` is `()`
+        }
         m => Err(core::Error::Transport {
             code: 404,
             message: format!("unknown method: {m}"),
@@ -332,7 +362,7 @@ fn init_logging() {
 /// One master and `n` secondaries, connected through one [`Network`].
 /// Secondaries have ids `NodeId(1)..=NodeId(n)`, the same as S1, S2, ... in the task.
 pub struct Cluster {
-    pub master: master::Node<Client>,
+    pub master: Arc<master::Node<Client>>,
     pub secondaries: HashMap<NodeId, Arc<secondary::Node>>,
     pub network: Arc<Network>,
 }
@@ -341,10 +371,13 @@ impl Cluster {
     /// Cluster where the master never times out on a slow secondary.
     /// For tests without failures (iterations 1 and 2).
     pub fn new(secondaries: usize) -> Self {
-        Self::with_config(LONG_TIMEOUT_CONFIG, secondaries)
+        Self::with_config(long_timeout_config(), secondaries)
     }
 
-    /// Cluster with the given master settings (timeout, retry delay).
+    /// Cluster with the given master settings (timeout, retry delay, heartbeats).
+    ///
+    /// Heartbeats are off until [`Cluster::start_heartbeats`], so every secondary
+    /// stays Healthy and the other tests do not depend on them.
     pub fn with_config(config: master::Config, secondaries: usize) -> Self {
         init_logging();
         let network = Arc::new(Network::default());
@@ -363,10 +396,23 @@ impl Cluster {
             })
             .collect();
         Self {
-            master: master::Node::new(config, clients),
+            master: Arc::new(master::Node::new(config, clients)),
             secondaries,
             network,
         }
+    }
+
+    /// Start the master's heartbeats to all secondaries.
+    pub fn start_heartbeats(&self) {
+        self.master.start_heartbeats();
+    }
+
+    /// The master's view of secondary `id`.
+    pub async fn health(&self, id: NodeId) -> NodeHealth {
+        let health = self.master.health().await;
+        *health
+            .get(&id)
+            .unwrap_or_else(|| panic!("no health for secondary {id:?}"))
     }
 
     /// Append a message with the given text and write concern through the master.

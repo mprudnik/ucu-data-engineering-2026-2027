@@ -3,7 +3,7 @@
 //! Handlers only parse the request, call the core node and turn the result
 //! into an HTTP response. No replication logic lives here.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -14,7 +14,11 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::core::{self, Request, master, message::Replicate, secondary};
+use crate::core::{
+    self, Request, master,
+    message::{Heartbeat, Replicate},
+    secondary,
+};
 
 /// Body of the client `POST /append` request: `{"value": "...", "write_concern": 2}`.
 #[derive(Debug, Deserialize)]
@@ -28,10 +32,12 @@ pub struct AppendBody {
 /// Master routes:
 /// - `POST /append` — append a message; returns after `write_concern` nodes have it.
 /// - `GET  /list`   — list all messages on the master.
+/// - `GET  /health` — status of each secondary, by id: `{"1": "healthy", "2": "suspected"}`.
 pub fn master_router<C: core::Client>(node: Arc<master::Node<C>>) -> Router {
     Router::new()
         .route("/append", post(master_append::<C>))
         .route("/list", get(master_list::<C>))
+        .route("/health", get(master_health::<C>))
         .with_state(node)
 }
 
@@ -53,15 +59,36 @@ async fn master_list<C: core::Client>(
     Json(node.list().await)
 }
 
+/// Secondaries ordered by id; the id is the JSON key.
+async fn master_health<C: core::Client>(
+    State(node): State<Arc<master::Node<C>>>,
+) -> Json<BTreeMap<usize, core::NodeHealth>> {
+    let health = node.health().await;
+    Json(
+        health
+            .into_iter()
+            .map(|(id, status)| (id.0, status))
+            .collect(),
+    )
+}
+
 /// Secondary routes:
 /// - `POST /replicate` — internal, called by the master; returns the ACK.
+/// - `POST /heartbeat` — internal, called by the master; an answer means the secondary is up.
 /// - `GET  /list`      — list all replicated messages.
 pub fn secondary_router(node: Arc<secondary::Node>) -> Router {
     let replicate_path = format!("/{}", <Replicate as Request>::METHOD);
+    let heartbeat_path = format!("/{}", <Heartbeat as Request>::METHOD);
     Router::new()
         .route(&replicate_path, post(secondary_replicate))
+        .route(&heartbeat_path, post(secondary_heartbeat))
         .route("/list", get(secondary_list))
         .with_state(node)
+}
+
+async fn secondary_heartbeat(Json(_): Json<Heartbeat>) -> Json<<Heartbeat as Request>::Response> {
+    tracing::debug!("heartbeat received");
+    Json(())
 }
 
 async fn secondary_replicate(

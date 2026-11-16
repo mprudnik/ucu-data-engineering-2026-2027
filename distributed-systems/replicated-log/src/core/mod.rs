@@ -7,6 +7,15 @@ pub mod secondary;
 #[derive(Debug, Clone, Copy, std::cmp::Eq, std::cmp::PartialEq, std::hash::Hash)]
 pub struct NodeId(pub usize);
 
+/// The master's view of a secondary, from heartbeats. As JSON: "healthy", "suspected", "unhealthy".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeHealth {
+    Healthy,
+    Suspected,
+    Unhealthy,
+}
+
 pub trait Request: Serialize + DeserializeOwned + Send + 'static {
     const METHOD: &'static str;
     type Response: Serialize + DeserializeOwned + Send + 'static;
