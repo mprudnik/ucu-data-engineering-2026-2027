@@ -1,16 +1,24 @@
+//! HTTP client side: [`core::Client`] over reqwest.
+
 use crate::core;
 
+/// Settings of a [`Client`].
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Base URL of the secondary, without a trailing `/`.
     pub url: String,
 }
 
+/// Sends requests to one secondary over HTTP.
+///
+/// Each request is a `POST` to `<url>/<METHOD>` with a JSON body.
 pub struct Client {
     config: Config,
     http: reqwest::Client,
 }
 
 impl Client {
+    /// Creates a client for the secondary at `config.url`.
     pub fn new(config: &Config) -> Self {
         Self {
             config: config.clone(),

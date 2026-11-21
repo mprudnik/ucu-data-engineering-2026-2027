@@ -13,8 +13,10 @@ mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
-/// Short timeout: a lost or slow message is sent again within a few seconds.
-/// The other settings are the defaults (retry delay 1s, max retry delay 30s).
+/// Returns the default settings with a short request timeout.
+///
+/// A lost or slow message is sent again within a few seconds.
+/// Defaults: retry delay 1s, max retry delay 30s.
 fn retry_config() -> master::Config {
     master::Config {
         request_timeout: Duration::from_secs(2),
@@ -22,11 +24,13 @@ fn retry_config() -> master::Config {
     }
 }
 
-/// Time for the master to notice a failure and send again:
-/// longer than the timeout plus the max retry delay.
+/// Time for the master to notice a failure and send again.
+///
+/// Longer than the timeout plus the max retry delay.
 const RETRY_WAIT: Duration = Duration::from_secs(60);
 
 /// Test "retry" from the task document.
+///
 /// Requests to S1 are lost for 10s. The master keeps sending m1,
 /// and S1 gets it after the link is back.
 #[tokio::test(start_paused = true)]
@@ -51,6 +55,7 @@ async fn lost_message_is_retried() -> anyhow::Result<()> {
 }
 
 /// Test "retry and deduplication" from the task document.
+///
 /// Requests to S2 take 10s, longer than the master's timeout. The master sends m2
 /// again, and the late copies still reach S2. S2 must store m2 only once.
 #[tokio::test(start_paused = true)]
@@ -75,6 +80,8 @@ async fn slow_message_is_retried_and_stored_once() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A lost ACK is retried, and the message is stored once.
+///
 /// S1 stores m1, but its ACKs are lost. The master sends m1 again until an ACK arrives.
 /// With write concern 3, the append waits for that ACK. S1 must store m1 only once.
 #[tokio::test(start_paused = true)]
@@ -99,6 +106,7 @@ async fn lost_ack_is_retried_and_message_stored_once() -> anyhow::Result<()> {
 }
 
 /// Test "total order" from the task document.
+///
 /// m3 to S1 is lost, m4 arrives. S1 hides m4 until the retry brings m3.
 #[tokio::test(start_paused = true)]
 async fn secondary_hides_messages_until_retry_fills_the_gap() -> anyhow::Result<()> {
@@ -132,7 +140,8 @@ async fn secondary_hides_messages_until_retry_fills_the_gap() -> anyhow::Result<
     Ok(())
 }
 
-/// The iteration 3 self-check acceptance test from the task document:
+/// The iteration 3 self-check acceptance test from the task document.
+///
 /// 1. M + S1 run, S2 is down
 /// 2. (m1, write concern 1) - ok
 /// 3. (m2, write concern 2) - ok
