@@ -61,7 +61,9 @@ enum Role {
     },
 }
 
-/// Default for a CLI option, in milliseconds, taken from `master::Config::default()`.
+/// Returns the default of a CLI option, in milliseconds.
+///
+/// The value comes from [`master::Config::default`].
 fn default_ms(field: fn(&master::Config) -> Duration) -> u64 {
     field(&master::Config::default()).as_millis() as u64
 }

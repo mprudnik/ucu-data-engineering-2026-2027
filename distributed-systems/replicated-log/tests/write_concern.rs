@@ -14,8 +14,9 @@ mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
-/// S1 answers after 5s, S2 after 6s. The append waits only for as many
-/// secondaries as the write concern needs.
+/// The append waits only for as many secondaries as the write concern needs.
+///
+/// S1 answers after 5s, S2 after 6s.
 #[tokio::test(start_paused = true)]
 async fn append_waits_only_for_write_concern() -> anyhow::Result<()> {
     let cluster = Cluster::new(SECONDARIES);
@@ -49,6 +50,8 @@ async fn invalid_write_concern_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A delayed secondary catches up after the delay.
+///
 /// With a delay on S2, the master and S2 return different lists for a while
 /// (inconsistency). After the delay, S2 catches up (eventual consistency).
 #[tokio::test(start_paused = true)]
@@ -71,7 +74,8 @@ async fn secondary_catches_up_after_delay() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The iteration 2 acceptance test from the task document:
+/// The iteration 2 acceptance test from the task document.
+///
 /// 1. M + S1 + S2, S2 has a 10s delay
 /// 2. (m1, write concern 1) - ok at once
 /// 3. (m2, write concern 2) - ok at once (S1 has no delay)

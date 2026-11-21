@@ -14,8 +14,9 @@ mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
-/// Default settings (heartbeat every 1s, Suspected after 3s, Unhealthy after 10s),
-/// with a short request timeout.
+/// Returns the default settings with a short request timeout.
+///
+/// Defaults: heartbeat every 1s, Suspected after 3s, Unhealthy after 10s.
 fn heartbeat_config() -> master::Config {
     master::Config {
         request_timeout: Duration::from_secs(1),
@@ -23,13 +24,16 @@ fn heartbeat_config() -> master::Config {
     }
 }
 
-/// Time for a status to change after its threshold: the master sees it
-/// only on the next heartbeat, so add two heartbeat intervals.
+/// Returns the time for a status to change after `threshold`.
+///
+/// The master sees the change only on the next heartbeat,
+/// so two heartbeat intervals are added.
 fn after(threshold: Duration, config: &master::Config) -> Duration {
     threshold + config.heartbeat_interval * 2
 }
 
 /// Both secondaries Unhealthy: 1 of 3 nodes, no quorum.
+///
 /// Every append is rejected, even with write concern 1, and nothing is stored.
 #[tokio::test(start_paused = true)]
 async fn append_is_rejected_without_quorum() -> anyhow::Result<()> {

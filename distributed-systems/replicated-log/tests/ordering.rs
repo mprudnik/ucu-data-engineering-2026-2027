@@ -10,7 +10,8 @@ mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
-/// The reordering test from the task document:
+/// The reordering test from the task document.
+///
 /// S1 gets m2 before m1, but lists them as [m1, m2].
 #[tokio::test(start_paused = true)]
 async fn secondary_lists_reordered_messages_in_order() -> anyhow::Result<()> {
@@ -28,6 +29,8 @@ async fn secondary_lists_reordered_messages_in_order() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A secondary hides messages after a gap.
+///
 /// S1 has m2 but not m1 yet: it must not show m2 until m1 arrives.
 #[tokio::test(start_paused = true)]
 async fn secondary_hides_messages_after_a_gap() -> anyhow::Result<()> {

@@ -5,7 +5,7 @@
 //! The status changes retries:
 //! - Healthy: pause of `retry_delay * attempt` (up to `max_retry_delay`);
 //! - Suspected: twice that pause;
-//! - Unhealthy: no sends; the master checks the status again every `max_retry_delay`.
+//! - Unhealthy: no sends; after the recovery, the secondary gets every message it missed.
 //!
 //! All tests run with paused Tokio time, so send times are exact.
 
@@ -21,8 +21,10 @@ mod harness;
 
 const NO_MESSAGES: [&str; 0] = [];
 
-/// Default settings (heartbeat every 1s, Suspected after 3s, Unhealthy after 10s,
-/// retry delay 1s, max retry delay 30s), with a short request timeout.
+/// Returns the default settings with a short request timeout.
+///
+/// Defaults: heartbeat every 1s, Suspected after 3s, Unhealthy after 10s,
+/// retry delay 1s, max retry delay 30s.
 fn heartbeat_config() -> master::Config {
     master::Config {
         request_timeout: Duration::from_secs(1),
@@ -30,17 +32,22 @@ fn heartbeat_config() -> master::Config {
     }
 }
 
-/// Time for a status to change after its threshold: the master sees it
-/// only on the next heartbeat, so add two heartbeat intervals.
+/// Returns the time for a status to change after `threshold`.
+///
+/// The master sees the change only on the next heartbeat,
+/// so two heartbeat intervals are added.
 fn after(threshold: Duration, config: &master::Config) -> Duration {
     threshold + config.heartbeat_interval * 2
 }
 
-/// Time for the master to resend after a secondary recovers:
-/// longer than the timeout plus the max retry delay.
+/// Time for the master to resend after a secondary recovers.
+///
+/// Longer than the timeout plus the max retry delay.
 const RETRY_WAIT: Duration = Duration::from_secs(60);
 
-/// All secondaries start Healthy, and the master keeps sending heartbeats.
+/// All secondaries start Healthy.
+///
+/// The master keeps sending heartbeats.
 #[tokio::test(start_paused = true)]
 async fn secondaries_start_healthy() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -58,9 +65,10 @@ async fn secondaries_start_healthy() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A stopped secondary fails every heartbeat:
-/// Suspected after `suspected_after`, Unhealthy after `unhealthy_after`.
-/// The other secondary stays Healthy.
+/// A stopped secondary becomes Suspected, then Unhealthy.
+///
+/// It fails every heartbeat: Suspected after `suspected_after`,
+/// Unhealthy after `unhealthy_after`. The other secondary stays Healthy.
 #[tokio::test(start_paused = true)]
 async fn stopped_secondary_becomes_suspected_then_unhealthy() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -79,7 +87,9 @@ async fn stopped_secondary_becomes_suspected_then_unhealthy() -> anyhow::Result<
     Ok(())
 }
 
-/// Lost heartbeats (no reply until the request timeout) count as missed, too.
+/// Lost heartbeats count as missed, too.
+///
+/// A lost heartbeat gets no reply until the request timeout.
 #[tokio::test(start_paused = true)]
 async fn lost_heartbeats_make_secondary_suspected() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -111,7 +121,7 @@ async fn secondary_becomes_healthy_after_one_heartbeat() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Healthy secondary: the first retry comes after `retry_delay`.
+/// The first retry to a Healthy secondary comes after `retry_delay`.
 #[tokio::test(start_paused = true)]
 async fn healthy_secondary_is_retried_after_retry_delay() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -131,7 +141,7 @@ async fn healthy_secondary_is_retried_after_retry_delay() -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Suspected secondary: the first retry comes after twice the `retry_delay`.
+/// The first retry to a Suspected secondary comes after twice the `retry_delay`.
 #[tokio::test(start_paused = true)]
 async fn suspected_secondary_is_retried_after_double_delay() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -154,8 +164,9 @@ async fn suspected_secondary_is_retried_after_double_delay() -> anyhow::Result<(
     Ok(())
 }
 
-/// Unhealthy secondary: the master sends it no messages, only heartbeats.
-/// When it is Healthy again, it gets every message it missed.
+/// The master sends an Unhealthy secondary no messages, only heartbeats.
+///
+/// When the secondary is Healthy again, it gets every message it missed.
 #[tokio::test(start_paused = true)]
 async fn unhealthy_secondary_gets_no_messages_until_healthy() -> anyhow::Result<()> {
     let config = heartbeat_config();
@@ -182,6 +193,38 @@ async fn unhealthy_secondary_gets_no_messages_until_healthy() -> anyhow::Result<
 
     tokio::time::sleep(RETRY_WAIT).await;
     assert_eq!(cluster.secondary_values(S1).await, ["m1", "m2"]);
+
+    Ok(())
+}
+
+/// A message not sent to an Unhealthy secondary is not its ACK.
+///
+/// With write concern 3 and S2 Unhealthy, the append is blocked until S2
+/// recovers and has the message (task: "w=3, the client should be blocked
+/// until the node becomes available").
+#[tokio::test(start_paused = true)]
+async fn unhealthy_secondary_does_not_count_as_ack() -> anyhow::Result<()> {
+    let config = heartbeat_config();
+    let cluster = Cluster::with_config(config.clone(), SECONDARIES);
+    let s2_down_time = Duration::from_secs(20);
+    cluster.network.stop_secondary(S2);
+    cluster.start_heartbeats();
+
+    tokio::time::sleep(after(config.unhealthy_after, &config)).await;
+    assert_eq!(cluster.health(S2).await, NodeHealth::Unhealthy);
+
+    let (m1_elapsed, ()) = tokio::join!(cluster.timed_append("m1", 3), async {
+        tokio::time::sleep(s2_down_time).await;
+        assert_eq!(cluster.secondary_values(S2).await, NO_MESSAGES);
+        cluster.network.start_secondary(S2);
+    });
+
+    let m1_elapsed = m1_elapsed?;
+    assert!(
+        m1_elapsed >= s2_down_time,
+        "append with write concern 3 should be blocked while S2 is unhealthy, returned after {m1_elapsed:?}",
+    );
+    assert_eq!(cluster.secondary_values(S2).await, ["m1"]);
 
     Ok(())
 }

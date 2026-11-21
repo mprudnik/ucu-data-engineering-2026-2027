@@ -29,6 +29,7 @@ use tokio::{sync::oneshot, time::Instant};
 
 /// Re-exported so tests can write `harness::NodeId`.
 pub use replicated_log::core::NodeId;
+/// Re-exported so tests can write `harness::NodeHealth`.
 pub use replicated_log::core::NodeHealth;
 use replicated_log::core::{
     self, Request, master,
@@ -38,10 +39,13 @@ use replicated_log::core::{
 
 /// Default cluster size in tests: master + 2 secondaries.
 pub const SECONDARIES: usize = 2;
+/// Secondary S1 from the task.
 pub const S1: NodeId = NodeId(1);
+/// Secondary S2 from the task.
 pub const S2: NodeId = NodeId(2);
 
-/// Master settings used by [`Cluster::new`].
+/// Returns the master settings used by [`Cluster::new`].
+///
 /// The timeout is longer than any delay in the tests, so a slow secondary
 /// is never retried. Tests for retries use [`Cluster::with_config`].
 fn long_timeout_config() -> master::Config {
@@ -55,8 +59,10 @@ fn long_timeout_config() -> master::Config {
 ///
 /// Settings are read once, when a send starts. A change does not affect
 /// requests that are already on the way.
-/// With write concern below all nodes, `append` returns before its background sends have started:
-/// call [`settle`] before changing settings, or the change also applies to those sends.
+///
+/// With write concern below all nodes, `append` returns before its background
+/// sends have started. Call [`settle`] before changing settings, or the change
+/// also applies to those sends.
 #[derive(Default)]
 pub struct Network {
     links: Mutex<HashMap<NodeId, Link>>,
@@ -112,59 +118,73 @@ enum ReorderStep {
 }
 
 impl Network {
-    /// Delay every request from the master to secondary `to`.
+    /// Delays every request from the master to secondary `to`.
     pub fn set_delay(&self, to: NodeId, delay: Duration) {
         self.update_link(to, |link| link.request_delay = delay);
     }
 
+    /// Removes the request delay set by [`Self::set_delay`].
     pub fn remove_delay(&self, to: NodeId) {
         self.update_link(to, |link| link.request_delay = Duration::ZERO);
     }
 
-    /// Delay every response (ACK) from secondary `to` back to the master.
+    /// Delays every response (ACK) from secondary `to` back to the master.
     pub fn set_response_delay(&self, to: NodeId, delay: Duration) {
         self.update_link(to, |link| link.response_delay = delay);
     }
 
+    /// Removes the response delay set by [`Self::set_response_delay`].
     pub fn remove_response_delay(&self, to: NodeId) {
         self.update_link(to, |link| link.response_delay = Duration::ZERO);
     }
 
-    /// Lose every request to secondary `to`: the secondary never sees it,
-    /// and the master gets no reply.
+    /// Drops every request to secondary `to`.
+    ///
+    /// The secondary never sees the request, and the master gets no reply.
     pub fn drop_requests(&self, to: NodeId) {
         self.update_link(to, |link| link.drop_requests = true);
     }
 
+    /// Stops dropping requests, as set by [`Self::drop_requests`].
     pub fn remove_drop(&self, to: NodeId) {
         self.update_link(to, |link| link.drop_requests = false);
     }
 
-    /// Lose every response (ACK) from secondary `to`: the secondary handles
-    /// the request and stores the message, but the master gets no reply.
+    /// Drops every response (ACK) from secondary `to`.
+    ///
+    /// The secondary handles the request and stores the message,
+    /// but the master gets no reply.
     pub fn drop_responses(&self, to: NodeId) {
         self.update_link(to, |link| link.drop_responses = true);
     }
 
+    /// Stops dropping responses, as set by [`Self::drop_responses`].
     pub fn remove_response_drop(&self, to: NodeId) {
         self.update_link(to, |link| link.drop_responses = false);
     }
 
-    /// Secondary `to` is down: every request fails at once with a transport
-    /// error, as when the connection is refused.
+    /// Stops secondary `to`.
+    ///
+    /// Every request then fails at once with a transport error,
+    /// as when the connection is refused.
     pub fn stop_secondary(&self, to: NodeId) {
         self.update_link(to, |link| link.stopped = true);
     }
 
+    /// Starts secondary `to` again after [`Self::stop_secondary`].
     pub fn start_secondary(&self, to: NodeId) {
         self.update_link(to, |link| link.stopped = false);
     }
 
-    /// Hold the next `count` requests to secondary `to`, then deliver them
-    /// in reverse order (the last one first). Works once; after the batch
-    /// is delivered, requests go through normally again.
+    /// Holds the next `count` requests to secondary `to`, then delivers them
+    /// in reverse order (the last one first).
     ///
-    /// Requests in the batch get no reply until the batch is full.
+    /// Works once. After the batch is delivered, requests go through normally
+    /// again. Requests in the batch get no reply until the batch is full.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` is 0.
     pub fn reorder(&self, to: NodeId, count: usize) {
         assert!(count > 0, "reorder count must be at least 1");
         let reorder = Reorder {
@@ -174,19 +194,24 @@ impl Network {
         self.reorders.lock().unwrap().insert(to, reorder);
     }
 
-    /// How many `method` sends to secondary `to` the master started, retries included.
-    /// `method` is a request's `METHOD`, e.g. `Replicate::METHOD`.
+    /// Returns how many `method` sends to secondary `to` the master started,
+    /// retries included.
+    ///
+    /// `method` is the `METHOD` of a request, for example [`Replicate::METHOD`].
     pub fn sent_requests(&self, to: NodeId, method: &str) -> usize {
         self.sent_times(to, method).len()
     }
 
-    /// When the master started each `method` send to secondary `to`, oldest first.
+    /// Returns when the master started each `method` send to secondary `to`,
+    /// oldest first.
     pub fn sent_times(&self, to: NodeId, method: &str) -> Vec<Instant> {
         Self::times(&self.sent, to, method)
     }
 
-    /// How many `method` requests secondary `to` handled. With retries this can be
-    /// more than the number of messages: the secondary got duplicates.
+    /// Returns how many `method` requests secondary `to` handled.
+    ///
+    /// With retries this can be more than the number of messages:
+    /// the secondary got duplicates.
     pub fn delivered_requests(&self, to: NodeId, method: &str) -> usize {
         Self::times(&self.delivered, to, method).len()
     }
@@ -322,7 +347,9 @@ async fn deliver(
     }
 }
 
-/// Same routing as the secondary's axum router, but in memory.
+/// Routes a request to the secondary, in memory.
+///
+/// Uses the same routes as the axum router of the secondary.
 async fn dispatch(node: &secondary::Node, method: &str, body: Value) -> Result<Value, core::Error> {
     match method {
         m if m == Replicate::METHOD => {
@@ -348,9 +375,11 @@ fn serde_error(e: serde_json::Error) -> core::Error {
     }
 }
 
-/// Sends `tracing` logs to the test output. Level comes from `RUST_LOG`.
-/// See them with: `RUST_LOG=info cargo test -- --nocapture`
-/// (without `--nocapture`, logs are shown only for failed tests).
+/// Sends `tracing` logs to the test output.
+///
+/// The level comes from `RUST_LOG`. See the logs with
+/// `RUST_LOG=info cargo test -- --nocapture`. Without `--nocapture`,
+/// logs are shown only for failed tests.
 fn init_logging() {
     // Fails when an earlier test in the same binary already set it up; that is fine.
     let _ = tracing_subscriber::fmt()
@@ -360,21 +389,26 @@ fn init_logging() {
 }
 
 /// One master and `n` secondaries, connected through one [`Network`].
+///
 /// Secondaries have ids `NodeId(1)..=NodeId(n)`, the same as S1, S2, ... in the task.
 pub struct Cluster {
+    /// The master node.
     pub master: Arc<master::Node<Client>>,
+    /// The secondary nodes, by id.
     pub secondaries: HashMap<NodeId, Arc<secondary::Node>>,
+    /// The links between the master and the secondaries.
     pub network: Arc<Network>,
 }
 
 impl Cluster {
-    /// Cluster where the master never times out on a slow secondary.
+    /// Creates a cluster where the master never times out on a slow secondary.
+    ///
     /// For tests without failures (iterations 1 and 2).
     pub fn new(secondaries: usize) -> Self {
         Self::with_config(long_timeout_config(), secondaries)
     }
 
-    /// Cluster with the given master settings (timeout, retry delay, heartbeats).
+    /// Creates a cluster with the given master settings (timeout, retry delay, heartbeats).
     ///
     /// Heartbeats are off until [`Cluster::start_heartbeats`], so every secondary
     /// stays Healthy and the other tests do not depend on them.
@@ -402,12 +436,16 @@ impl Cluster {
         }
     }
 
-    /// Start the master's heartbeats to all secondaries.
+    /// Starts the heartbeats from the master to all secondaries.
     pub fn start_heartbeats(&self) {
         self.master.start_heartbeats();
     }
 
-    /// The master's view of secondary `id`.
+    /// Returns the health of secondary `id`, as the master sees it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no secondary `id`.
     pub async fn health(&self, id: NodeId) -> NodeHealth {
         let health = self.master.health().await;
         *health
@@ -415,12 +453,12 @@ impl Cluster {
             .unwrap_or_else(|| panic!("no health for secondary {id:?}"))
     }
 
-    /// Append a message with the given text and write concern through the master.
+    /// Appends a message with the given text and write concern through the master.
     pub async fn append(&self, value: &str, write_concern: usize) -> Result<(), core::Error> {
         self.master.append(value.to_string(), write_concern).await
     }
 
-    /// Append and return how long the append was blocked.
+    /// Appends a message and returns how long the append was blocked.
     pub async fn timed_append(
         &self,
         value: &str,
@@ -431,12 +469,16 @@ impl Cluster {
         Ok(start.elapsed())
     }
 
-    /// Messages on the master.
+    /// Returns the messages on the master.
     pub async fn master_values(&self) -> Vec<String> {
         self.master.list().await
     }
 
-    /// Messages on secondary `id`.
+    /// Returns the messages on secondary `id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no secondary `id`.
     pub async fn secondary_values(&self, id: NodeId) -> Vec<String> {
         let node = self
             .secondaries
@@ -446,8 +488,10 @@ impl Cluster {
     }
 }
 
-/// Lets background replication run until it is blocked again
-/// (by a delay, a reorder batch, a dropped message, or because it is done).
+/// Lets background replication run until it is blocked again.
+///
+/// Replication is blocked by a delay, a reorder batch, a dropped message,
+/// or because it is done.
 ///
 /// With paused time, Tokio moves the clock only when no task can run.
 /// So all ready tasks run first. Moves the clock by 1ms.

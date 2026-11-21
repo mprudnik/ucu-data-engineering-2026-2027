@@ -20,19 +20,29 @@ use crate::core::{
     secondary,
 };
 
-/// Body of the client `POST /append` request: `{"value": "...", "write_concern": 2}`.
+/// Body of the client `POST /append` request.
+///
+/// ```json
+/// {"value": "m1", "write_concern": 2}
+/// ```
 #[derive(Debug, Deserialize)]
 pub struct AppendBody {
+    /// Text of the message.
     pub value: String,
-    /// How many nodes must have the message before the reply:
-    /// `1` = master only, `2` = master + 1 secondary, `3` = master + 2 secondaries.
+    /// How many nodes must have the message before the reply.
+    ///
+    /// `1` is the master only, `2` is the master + 1 secondary,
+    /// `3` is the master + 2 secondaries.
     pub write_concern: usize,
 }
 
-/// Master routes:
-/// - `POST /append` — append a message; returns after `write_concern` nodes have it.
-/// - `GET  /list`   — list all messages on the master.
-/// - `GET  /health` — status of each secondary, by id: `{"1": "healthy", "2": "suspected"}`.
+/// Builds the router of the master.
+///
+/// Routes:
+/// - `POST /append` appends a message and returns after `write_concern` nodes have it;
+/// - `GET /list` lists all messages on the master;
+/// - `GET /health` returns the health of each secondary, by id:
+///   `{"1": "healthy", "2": "suspected"}`.
 pub fn master_router<C: core::Client>(node: Arc<master::Node<C>>) -> Router {
     Router::new()
         .route("/append", post(master_append::<C>))
@@ -59,7 +69,9 @@ async fn master_list<C: core::Client>(
     Json(node.list().await)
 }
 
-/// Secondaries ordered by id; the id is the JSON key.
+/// Returns the health of each secondary, ordered by id.
+///
+/// The id is the JSON key.
 async fn master_health<C: core::Client>(
     State(node): State<Arc<master::Node<C>>>,
 ) -> Json<BTreeMap<usize, core::NodeHealth>> {
@@ -72,10 +84,12 @@ async fn master_health<C: core::Client>(
     )
 }
 
-/// Secondary routes:
-/// - `POST /replicate` — internal, called by the master; returns the ACK.
-/// - `POST /heartbeat` — internal, called by the master; an answer means the secondary is up.
-/// - `GET  /list`      — list all replicated messages.
+/// Builds the router of a secondary.
+///
+/// Routes:
+/// - `POST /replicate` stores a message and returns the ACK (internal, called by the master);
+/// - `POST /heartbeat` replies to show that the secondary is up (internal, called by the master);
+/// - `GET /list` lists all replicated messages.
 pub fn secondary_router(node: Arc<secondary::Node>) -> Router {
     let replicate_path = format!("/{}", <Replicate as Request>::METHOD);
     let heartbeat_path = format!("/{}", <Heartbeat as Request>::METHOD);
@@ -107,9 +121,12 @@ async fn secondary_list(State(node): State<Arc<secondary::Node>>) -> Json<Vec<St
     Json(node.list().await)
 }
 
-/// Core errors as HTTP replies:
-/// - write concern out of range -> `400 Bad Request`;
-/// - a secondary could not be reached or failed -> `502 Bad Gateway`.
+/// Converts a core error into an HTTP reply.
+///
+/// Status codes:
+/// - `400 Bad Request` if the write concern is out of range;
+/// - `502 Bad Gateway` if a secondary could not be reached or failed;
+/// - `503 Service Unavailable` if there is no quorum.
 impl IntoResponse for core::Error {
     fn into_response(self) -> Response {
         let status = match self {
@@ -124,6 +141,10 @@ impl IntoResponse for core::Error {
 }
 
 /// Binds `0.0.0.0:<port>` and serves the router until the process stops.
+///
+/// # Errors
+///
+/// Returns an error if the port cannot be bound or the server fails.
 pub async fn serve(router: Router, port: u16) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(port, "listening");

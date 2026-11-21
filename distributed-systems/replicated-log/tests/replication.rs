@@ -13,8 +13,9 @@ mod harness;
 /// Master + all secondaries.
 const ALL: usize = SECONDARIES + 1;
 
-/// Sends go to all secondaries at the same time:
-/// with delays of 5s and 6s, the append takes 6s, not 11s.
+/// Sends go to all secondaries at the same time.
+///
+/// With delays of 5s and 6s, the append takes 6s, not 11s.
 #[tokio::test(start_paused = true)]
 async fn replication_runs_parallel() -> anyhow::Result<()> {
     let cluster = Cluster::new(SECONDARIES);
@@ -28,8 +29,9 @@ async fn replication_runs_parallel() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The append returns only after the slowest secondary has ACKed,
-/// and by then every secondary has the message.
+/// The append returns only after the slowest secondary has ACKed.
+///
+/// By then every secondary has the message.
 #[tokio::test(start_paused = true)]
 async fn master_waits_for_acks_from_all_secondaries() -> anyhow::Result<()> {
     let cluster = Cluster::new(SECONDARIES);
